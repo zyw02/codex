@@ -1,0 +1,102 @@
+name: Build Codex App Server for Span on EL8
+
+on:
+  push:
+    branches: [span-backend]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: span-backend-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    env:
+      TARGET: x86_64-unknown-linux-musl
+      CODEX_MUSL_RELEASE_LINK_FLAGS: '1'
+      AWS_LC_SYS_NO_JITTER_ENTROPY: '1'
+      AWS_LC_SYS_NO_JITTER_ENTROPY_x86_64_unknown_linux_musl: '1'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.14.0
+          use-cache: false
+
+      - name: Install upstream musl build tools
+        run: bash .github/scripts/install-musl-build-tools.sh
+
+      - name: Configure verified V8 archives
+        uses: ./.github/actions/setup-rusty-v8
+        with:
+          target: x86_64-unknown-linux-musl
+
+      - name: Build the sandbox helper and main binaries
+        working-directory: codex-rs
+        shell: bash
+        run: |
+          export STABLE_GIT_COMMIT="$(git rev-parse HEAD)"
+          output="target/$TARGET/release"
+          cargo build --locked --release --target "$TARGET" --bin bwrap
+          strip --strip-debug --strip-unneeded "$output/bwrap"
+          CODEX_BWRAP_SHA256="$(sha256sum "$output/bwrap" | cut -d ' ' -f 1)"
+          export CODEX_BWRAP_SHA256
+          cargo build --locked --release --target "$TARGET" \
+            --bin codex --bin codex-exec-server --bin codex-code-mode-host
+          strip --strip-debug "$output/codex" "$output/codex-exec-server" "$output/codex-code-mode-host"
+
+      - name: Package the runtime using the upstream layout
+        working-directory: codex-rs
+        shell: bash
+        run: |
+          bash ../.github/scripts/build-codex-package-archive.sh \
+            --target "$TARGET" --bundle primary \
+            --entrypoint-dir "target/$TARGET/release" --archive-dir "$RUNNER_TEMP/span-backend"
+          cd "$RUNNER_TEMP/span-backend"
+          archive="codex-package-$TARGET.tar.gz"
+          sha256sum "$archive" > SHA256SUMS
+          mkdir unpacked
+          tar -xzf "$archive" -C unpacked
+
+      - name: Test App Server startup in an EL8 container
+        shell: bash
+        run: |
+          docker run --rm --network none \
+            --volume "$RUNNER_TEMP/span-backend/unpacked:/backend:ro" \
+            almalinux:8 bash -euo pipefail -c '
+              test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.28"
+              codex=$(find /backend -type f -name codex -print -quit)
+              test -x "$codex"
+              "$codex" --version
+              export CODEX_HOME=$(mktemp -d)
+              result=$({ cat <<REQUEST
+          {"id":1,"method":"initialize","params":{"clientInfo":{"name":"span-ci","version":"0.1.0"},"capabilities":{"experimentalApi":true}}}
+          REQUEST
+                sleep 2
+              } | timeout 20s "$codex" app-server)
+              grep -Fq "\"userAgent\"" <<< "$result"
+            '
+
+      - name: Upload the verified runtime
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: span-codex-backend-el8-x86_64
+          path: |
+            ${{ runner.temp }}/span-backend/codex-package-x86_64-unknown-linux-musl.tar.gz
+            ${{ runner.temp }}/span-backend/SHA256SUMS
+          if-no-files-found: error
