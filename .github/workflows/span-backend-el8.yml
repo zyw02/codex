@@ -18,6 +18,7 @@ jobs:
     timeout-minutes: 65
     env:
       TARGET: x86_64-unknown-linux-musl
+      CODEX_REPO_ROOT: ${{ github.workspace }}
       CODEX_MUSL_RELEASE_LINK_FLAGS: '1'
       AWS_LC_SYS_NO_JITTER_ENTROPY: '1'
       AWS_LC_SYS_NO_JITTER_ENTROPY_x86_64_unknown_linux_musl: '1'
@@ -28,6 +29,22 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+
+      - name: Validate the upstream archive tools before compiling
+        run: |
+          preflight="$(mktemp -d "$RUNNER_TEMP/packaging.XXXXXX")"
+          mkdir "$preflight/bin"
+          for bin in codex codex-exec-server codex-code-mode-host bwrap; do
+            install -m 0755 /usr/bin/true "$preflight/bin/$bin"
+          done
+          if ! command -v zstd >/dev/null; then
+            sudo apt-get update -y
+            sudo apt-get install -y --no-install-recommends zstd
+          fi
+          RUNNER_TEMP="$preflight" bash .github/scripts/build-codex-package-archive.sh \
+            --target "$TARGET" --bundle primary \
+            --entrypoint-dir "$preflight/bin" --archive-dir "$preflight/archives"
+          tar -tzf "$preflight/archives/codex-package-$TARGET.tar.gz" >/dev/null
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
@@ -49,6 +66,7 @@ jobs:
           target: x86_64-unknown-linux-musl
 
       - name: Build the sandbox helper and main binaries
+        id: compile
         working-directory: codex-rs
         shell: bash
         run: |
@@ -88,8 +106,9 @@ jobs:
               codex=$(find /backend -type f -name codex -print -quit)
               test -x "$codex"
               "$codex" --version
-              CODEX_HOME=$(mktemp -d)
-              export CODEX_HOME
+              fixture=$(mktemp -d)
+              export CODEX_HOME="$fixture/codex" TMPDIR="$fixture/tmp"
+              mkdir "$CODEX_HOME" "$TMPDIR"
               cat > "$CODEX_HOME/config.toml" <<CONFIG
           model = "internal-model"
           model_provider = "internal_gateway"
@@ -98,24 +117,38 @@ jobs:
           base_url = "http://127.0.0.1:9/v1"
           wire_api = "responses"
           CONFIG
-              result=$({ cat <<REQUEST
-          {"id":1,"method":"initialize","params":{"clientInfo":{"name":"span-ci","version":"0.1.0"},"capabilities":{"experimentalApi":true}}}
-          {"method":"initialized"}
-          {"id":2,"method":"model/list","params":{"modelProvider":"internal_gateway","limit":50}}
-          REQUEST
-                sleep 2
-              } | timeout 20s "$codex" app-server)
-              /usr/libexec/platform-python -c "
-          import json, sys
-          replies = {}
-          for line in sys.stdin:
-              value = json.loads(line)
-              if \"result\" in value:
-                  replies[value[\"id\"]] = value[\"result\"]
-          assert \"userAgent\" in replies[1], replies
-          assert [row[\"model\"] for row in replies[2][\"data\"]] == [\"internal-model\"], replies
-          print(\"EL8 App Server initialized and listed only the configured gateway model.\")
-          " <<< "$result"
+              timeout 25s /usr/libexec/platform-python - "$codex" <<PY
+          import json
+          import subprocess
+          import sys
+
+          with subprocess.Popen([sys.argv[1], "app-server"], stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, universal_newlines=True) as server:
+              def send(payload):
+                  server.stdin.write(json.dumps(payload) + "\\n")
+                  server.stdin.flush()
+
+              def result(request_id):
+                  for line in server.stdout:
+                      message = json.loads(line)
+                      if message.get("id") == request_id:
+                          assert "result" in message, message
+                          return message["result"]
+                  raise RuntimeError("App Server stopped before replying")
+
+              send({"id": 1, "method": "initialize", "params": {
+                  "clientInfo": {"name": "span-ci", "version": "0.1.0"},
+                  "capabilities": {"experimentalApi": True}}})
+              assert "userAgent" in result(1)
+              send({"method": "initialized"})
+              send({"id": 2, "method": "model/list", "params": {
+                  "modelProvider": "internal_gateway", "limit": 50}})
+              models = [row["model"] for row in result(2)["data"]]
+              assert models == ["internal-model"], models
+              server.stdin.close()
+              assert server.wait(timeout=5) == 0
+          print("EL8 App Server initialized and listed only the configured gateway model.")
+          PY
             '
 
       - name: Upload the verified runtime
@@ -127,6 +160,19 @@ jobs:
             ${{ runner.temp }}/span-backend/SHA256SUMS
           if-no-files-found: error
 
+      - name: Preserve compiled inputs if packaging or verification fails
+        if: failure() && steps.compile.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: span-codex-backend-unverified-build-inputs
+          path: |
+            codex-rs/target/x86_64-unknown-linux-musl/release/codex
+            codex-rs/target/x86_64-unknown-linux-musl/release/codex-code-mode-host
+            codex-rs/target/x86_64-unknown-linux-musl/release/codex-exec-server
+            codex-rs/target/x86_64-unknown-linux-musl/release/bwrap
+          retention-days: 3
+          if-no-files-found: error
+
   span:
     needs: backend
     runs-on: ubuntu-24.04
@@ -136,7 +182,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: vellinlab/span
-          ref: 97a4951e3724d0c05c28d143268e32ecd226964d
+          ref: 61943ceb3459760ac2a478bbbaccdb1e4b5a186b
           persist-credentials: false
 
       - name: Download the backend built by this workflow
