@@ -22,6 +22,8 @@ jobs:
       AWS_LC_SYS_NO_JITTER_ENTROPY: '1'
       AWS_LC_SYS_NO_JITTER_ENTROPY_x86_64_unknown_linux_musl: '1'
       CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_PROFILE_RELEASE_DEBUG: '0'
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -52,12 +54,15 @@ jobs:
         run: |
           export STABLE_GIT_COMMIT="$(git rev-parse HEAD)"
           output="target/$TARGET/release"
-          cargo build --locked --release --target "$TARGET" --bin bwrap
+          # Upstream refreshes the workspace lock at this step for release tags.
+          cargo build --release --target "$TARGET" --bin bwrap
+          git diff --stat -- Cargo.lock
           strip --strip-debug --strip-unneeded "$output/bwrap"
           CODEX_BWRAP_SHA256="$(sha256sum "$output/bwrap" | cut -d ' ' -f 1)"
           export CODEX_BWRAP_SHA256
           cargo build --locked --release --target "$TARGET" \
-            --bin codex --bin codex-exec-server --bin codex-code-mode-host
+            --bin codex --bin codex-exec-server --bin codex-code-mode-host \
+            --bin codex-responses-api-proxy
           strip --strip-debug "$output/codex" "$output/codex-exec-server" "$output/codex-code-mode-host"
 
       - name: Package the runtime using the upstream layout
@@ -121,3 +126,38 @@ jobs:
             ${{ runner.temp }}/span-backend/codex-package-x86_64-unknown-linux-musl.tar.gz
             ${{ runner.temp }}/span-backend/SHA256SUMS
           if-no-files-found: error
+
+  span:
+    needs: backend
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out the Span compatibility fixture
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: vellinlab/span
+          ref: 97a4951e3724d0c05c28d143268e32ecd226964d
+          persist-credentials: false
+
+      - name: Download the backend built by this workflow
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: span-codex-backend-el8-x86_64
+          path: ${{ runner.temp }}/span-backend
+
+      - name: Verify the combined RPM and backend on EL8
+        run: |
+          backend_dir="$RUNNER_TEMP/span-backend"
+          (cd "$backend_dir"; sha256sum --check SHA256SUMS)
+          tar -xzf "$backend_dir/codex-package-x86_64-unknown-linux-musl.tar.gz" -C "$backend_dir"
+          docker run --rm --volume "$PWD:/work" --workdir /work \
+            almalinux:8 bash packaging/build-el8.sh
+          docker run --rm --volume "$PWD:/work:ro" --workdir /work \
+            --volume "$backend_dir:/span-backend:ro" almalinux:8 bash -euo pipefail -c '
+              dnf --setopt=install_weak_deps=False -y install epel-release
+              dnf -y install /work/dist/span-*.rpm python39 python3-pyatspi git \
+                dbus-daemon xorg-x11-server-Xvfb xdotool xclip
+              backend=$(find /span-backend -type f -name codex -print -quit)
+              test -x "$backend"
+              dbus-run-session -- bash packaging/test-real-app-server.sh /usr/bin/span "$backend"
+            '
