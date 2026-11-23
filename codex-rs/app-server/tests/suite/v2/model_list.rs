@@ -3,6 +3,7 @@ use std::time::Duration;
 use anyhow::Error;
 use anyhow::Result;
 use app_test_support::ChatGptAuthFixture;
+use app_test_support::MockResponsesConfig;
 use app_test_support::TestAppServer;
 use app_test_support::write_chatgpt_auth;
 use app_test_support::write_models_cache;
@@ -286,6 +287,39 @@ async fn list_models_returns_all_models_with_large_limit() -> Result<()> {
 
     assert_eq!(items, expected_models);
     assert!(next_cursor.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn custom_gateway_without_catalog_lists_its_configured_model() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new("http://127.0.0.1:9")
+        .with_model("internal-model")
+        .write(codex_home.path())?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized()
+        .await?;
+    let result: ModelListResponse = mcp
+        .request(|request_id| ClientRequest::ModelList {
+            request_id,
+            params: ModelListParams {
+                limit: Some(100),
+                ..Default::default()
+            },
+        })
+        .await?;
+
+    assert_eq!(
+        result
+            .data
+            .iter()
+            .map(|model| model.model.as_str())
+            .collect::<Vec<_>>(),
+        vec!["internal-model"]
+    );
+    assert!(result.next_cursor.is_none());
     Ok(())
 }
 

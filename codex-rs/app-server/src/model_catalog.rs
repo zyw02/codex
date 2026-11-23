@@ -9,10 +9,15 @@ use codex_core::ThreadManager;
 use codex_core::config::Config;
 use codex_features::Feature;
 use codex_model_provider_info::OPENAI_PROVIDER_ID;
+use codex_model_provider_info::built_in_model_providers;
+use codex_models_manager::CatalogModel;
 use codex_models_manager::ModelOrigin;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_models_manager::manager::SharedModelsManager;
+use codex_models_manager::model_info::model_info_from_slug;
+use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ModelPreset;
+use codex_protocol::openai_models::ModelVisibility;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use tokio::sync::Mutex;
 
@@ -147,9 +152,27 @@ impl ModelCatalog {
         self.config_manager
             .check_thread_model_provider(&config)
             .await?;
-        let catalog = models_manager
+        let mut catalog = models_manager
             .model_catalog_with_origins(refresh_strategy, config.http_client_factory())
             .await;
+        if config.model_provider.base_url.is_some()
+            && !built_in_model_providers(/*openai_base_url*/ None)
+                .contains_key(&config.model_provider_id)
+        {
+            // Bundled OpenAI model IDs are not a catalog for a custom gateway.
+            catalog.retain(|entry| entry.origin != ModelOrigin::Bundled);
+            if let Some(model) = config.model.as_deref()
+                && !catalog.iter().any(|entry| entry.slug == model)
+            {
+                let mut metadata = model_info_from_slug(model);
+                metadata.visibility = ModelVisibility::List;
+                metadata.input_modalities = vec![InputModality::Text];
+                catalog.push(CatalogModel {
+                    model: Arc::new(metadata),
+                    origin: ModelOrigin::Synthetic,
+                });
+            }
+        }
         // The first-party catalog supplies picker rows in display order. Bundled,
         // configured and third-party catalogs rely on the manager's priority order.
         let use_catalog_order = config.model_provider_id == OPENAI_PROVIDER_ID

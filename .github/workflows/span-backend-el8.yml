@@ -73,7 +73,7 @@ jobs:
           mkdir unpacked
           tar -xzf "$archive" -C unpacked
 
-      - name: Test App Server startup in an EL8 container
+      - name: Test startup and custom model catalog on EL8
         shell: bash
         run: |
           docker run --rm --network none \
@@ -83,13 +83,34 @@ jobs:
               codex=$(find /backend -type f -name codex -print -quit)
               test -x "$codex"
               "$codex" --version
-              export CODEX_HOME=$(mktemp -d)
+              CODEX_HOME=$(mktemp -d)
+              export CODEX_HOME
+              cat > "$CODEX_HOME/config.toml" <<CONFIG
+          model = "internal-model"
+          model_provider = "internal_gateway"
+          [model_providers.internal_gateway]
+          name = "Internal gateway"
+          base_url = "http://127.0.0.1:9/v1"
+          wire_api = "responses"
+          CONFIG
               result=$({ cat <<REQUEST
           {"id":1,"method":"initialize","params":{"clientInfo":{"name":"span-ci","version":"0.1.0"},"capabilities":{"experimentalApi":true}}}
+          {"method":"initialized"}
+          {"id":2,"method":"model/list","params":{"modelProvider":"internal_gateway","limit":50}}
           REQUEST
                 sleep 2
               } | timeout 20s "$codex" app-server)
-              grep -Fq "\"userAgent\"" <<< "$result"
+              /usr/libexec/platform-python -c "
+          import json, sys
+          replies = {}
+          for line in sys.stdin:
+              value = json.loads(line)
+              if \"result\" in value:
+                  replies[value[\"id\"]] = value[\"result\"]
+          assert \"userAgent\" in replies[1], replies
+          assert [row[\"model\"] for row in replies[2][\"data\"]] == [\"internal-model\"], replies
+          print(\"EL8 App Server initialized and listed only the configured gateway model.\")
+          " <<< "$result"
             '
 
       - name: Upload the verified runtime
