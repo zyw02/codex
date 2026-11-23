@@ -5,7 +5,7 @@ usage() {
   cat <<'EOF'
 Usage: build-codex-package-archive.sh \
   --target <rust-target> \
-  --bundle <primary|app-server> \
+  --bundle <primary|app-server|clue> \
   --entrypoint-dir <dir> \
   --archive-dir <dir> \
   [--bwrap-bin <path>] \
@@ -113,6 +113,11 @@ if [[ ( -n "$voice_release_dir" || -n "$release_version" ) && ( -z "$voice_relea
 fi
 
 case "$bundle" in
+  clue)
+    variant="clue"
+    entrypoint="codex"
+    archive_stem="clue-package"
+    ;;
   primary)
     variant="codex"
     entrypoint="codex"
@@ -196,7 +201,7 @@ python_args=(
   --cargo-profile release
   --package-dir "$package_dir"
 )
-if [[ -z "$voice_release_dir" ]]; then
+if [[ -z "$voice_release_dir" && "$bundle" != "clue" ]]; then
   python_args+=(--archive-output "$gzip_archive_path" --archive-output "$zstd_archive_path")
 fi
 if ((${#resource_args[@]} > 0)); then
@@ -205,6 +210,13 @@ fi
 python_args+=(--force)
 
 "$python_bin" "${python_args[@]}"
+
+if [[ "$bundle" == "clue" ]]; then
+  for file in LICENSE NOTICE CLUE.md; do
+    install -m 0644 "$repo_root/$file" "$package_dir/$file"
+  done
+  tar -czf "$gzip_archive_path" -C "$package_dir" .
+fi
 
 if [[ -n "$voice_release_dir" ]]; then
   voice_target="$target"

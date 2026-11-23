@@ -53,6 +53,11 @@ class PackageInputs:
 
 
 PACKAGE_VARIANTS: dict[str, PackageVariant] = {
+    "clue": PackageVariant(
+        name="clue",
+        cargo_bin="codex",
+        executable_stem="clue",
+    ),
     "codex": PackageVariant(
         name="codex",
         cargo_bin="codex",

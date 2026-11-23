@@ -1,4 +1,4 @@
-name: Build Codex App Server for Span on EL8
+name: Build Clue for EL8
 
 on:
   push:
@@ -15,7 +15,7 @@ concurrency:
 jobs:
   backend:
     runs-on: ubuntu-24.04
-    timeout-minutes: 65
+    timeout-minutes: 90
     env:
       TARGET: x86_64-unknown-linux-musl
       CODEX_REPO_ROOT: ${{ github.workspace }}
@@ -42,9 +42,9 @@ jobs:
             sudo apt-get install -y --no-install-recommends zstd
           fi
           RUNNER_TEMP="$preflight" bash .github/scripts/build-codex-package-archive.sh \
-            --target "$TARGET" --bundle primary \
+            --target "$TARGET" --bundle clue \
             --entrypoint-dir "$preflight/bin" --archive-dir "$preflight/archives"
-          tar -tzf "$preflight/archives/codex-package-$TARGET.tar.gz" >/dev/null
+          tar -tzf "$preflight/archives/clue-package-$TARGET.tar.gz" >/dev/null
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
@@ -88,10 +88,10 @@ jobs:
         shell: bash
         run: |
           bash ../.github/scripts/build-codex-package-archive.sh \
-            --target "$TARGET" --bundle primary \
+            --target "$TARGET" --bundle clue \
             --entrypoint-dir "target/$TARGET/release" --archive-dir "$RUNNER_TEMP/span-backend"
           cd "$RUNNER_TEMP/span-backend"
-          archive="codex-package-$TARGET.tar.gz"
+          archive="clue-package-$TARGET.tar.gz"
           sha256sum "$archive" > SHA256SUMS
           mkdir unpacked
           tar -xzf "$archive" -C unpacked
@@ -103,13 +103,14 @@ jobs:
             --volume "$RUNNER_TEMP/span-backend/unpacked:/backend:ro" \
             almalinux:8 bash -euo pipefail -c '
               test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.28"
-              codex=$(find /backend -type f -name codex -print -quit)
-              test -x "$codex"
-              "$codex" --version
+              clue=/backend/bin/clue
+              test -x "$clue"
+              "$clue" --version | grep -E "^clue [0-9]"
+              test -s /backend/LICENSE && test -s /backend/NOTICE && test -s /backend/CLUE.md
               fixture=$(mktemp -d)
-              export CODEX_HOME="$fixture/codex" TMPDIR="$fixture/tmp"
-              mkdir "$CODEX_HOME" "$TMPDIR"
-              cat > "$CODEX_HOME/config.toml" <<CONFIG
+              export CLUE_HOME="$fixture/clue" CODEX_HOME="$fixture/codex-unused" TMPDIR="$fixture/tmp"
+              mkdir "$CLUE_HOME" "$TMPDIR"
+              cat > "$CLUE_HOME/config.toml" <<CONFIG
           model = "internal-model"
           model_provider = "internal_gateway"
           [model_providers.internal_gateway]
@@ -117,13 +118,15 @@ jobs:
           base_url = "http://127.0.0.1:9/v1"
           wire_api = "responses"
           CONFIG
-              timeout 25s /usr/libexec/platform-python - "$codex" <<PY
+              timeout 25s /usr/libexec/platform-python - "$clue" <<PY
           import json
+          from pathlib import Path
           import subprocess
           import sys
 
           with subprocess.Popen([sys.argv[1], "app-server"], stdin=subprocess.PIPE,
                                 stdout=subprocess.PIPE, universal_newlines=True) as server:
+              assert Path("/proc/{}/comm".format(server.pid)).read_text().strip() == "clue"
               def send(payload):
                   server.stdin.write(json.dumps(payload) + "\\n")
                   server.stdin.flush()
@@ -154,9 +157,9 @@ jobs:
       - name: Upload the verified runtime
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: span-codex-backend-el8-x86_64
+          name: clue-el8-x86_64
           path: |
-            ${{ runner.temp }}/span-backend/codex-package-x86_64-unknown-linux-musl.tar.gz
+            ${{ runner.temp }}/span-backend/clue-package-x86_64-unknown-linux-musl.tar.gz
             ${{ runner.temp }}/span-backend/SHA256SUMS
           if-no-files-found: error
 
@@ -173,37 +176,3 @@ jobs:
           retention-days: 3
           if-no-files-found: error
 
-  span:
-    needs: backend
-    runs-on: ubuntu-24.04
-    timeout-minutes: 25
-    steps:
-      - name: Check out the Span compatibility fixture
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: vellinlab/span
-          ref: 61943ceb3459760ac2a478bbbaccdb1e4b5a186b
-          persist-credentials: false
-
-      - name: Download the backend built by this workflow
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: span-codex-backend-el8-x86_64
-          path: ${{ runner.temp }}/span-backend
-
-      - name: Verify the combined RPM and backend on EL8
-        run: |
-          backend_dir="$RUNNER_TEMP/span-backend"
-          (cd "$backend_dir"; sha256sum --check SHA256SUMS)
-          tar -xzf "$backend_dir/codex-package-x86_64-unknown-linux-musl.tar.gz" -C "$backend_dir"
-          docker run --rm --volume "$PWD:/work" --workdir /work \
-            almalinux:8 bash packaging/build-el8.sh
-          docker run --rm --volume "$PWD:/work:ro" --workdir /work \
-            --volume "$backend_dir:/span-backend:ro" almalinux:8 bash -euo pipefail -c '
-              dnf --setopt=install_weak_deps=False -y install epel-release
-              dnf -y install /work/dist/span-*.rpm python39 python3-pyatspi git \
-                dbus-daemon xorg-x11-server-Xvfb xdotool xclip
-              backend=$(find /span-backend -type f -name codex -print -quit)
-              test -x "$backend"
-              dbus-run-session -- bash packaging/test-real-app-server.sh /usr/bin/span "$backend"
-            '
