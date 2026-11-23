@@ -156,13 +156,16 @@ impl ModelCatalog {
             .model_catalog_with_origins(refresh_strategy, config.http_client_factory())
             .await;
         if config.model_provider.base_url.is_some()
+            && !config.model_provider.requires_openai_auth
             && !built_in_model_providers(/*openai_base_url*/ None)
                 .contains_key(&config.model_provider_id)
         {
             // Bundled OpenAI model IDs are not a catalog for a custom gateway.
             catalog.retain(|entry| entry.origin != ModelOrigin::Bundled);
-            if let Some(model) = config.model.as_deref()
-                && !catalog.iter().any(|entry| entry.slug == model)
+            if catalog.is_empty()
+                && config.model_catalog.is_none()
+                && config.model_provider.model_catalog_url.is_none()
+                && let Some(model) = config.model.as_deref()
             {
                 let mut metadata = model_info_from_slug(model);
                 metadata.visibility = ModelVisibility::List;
